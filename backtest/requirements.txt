@@ -1,0 +1,4 @@
+backtesting>=0.6
+yfinance>=1.0
+pandas>=2.0
+numpy>=1.26

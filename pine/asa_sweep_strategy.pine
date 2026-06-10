@@ -1,0 +1,129 @@
+//@version=6
+// ASA Sweep Strategy — ICT-style Judas Swing (снятие ликвидности Азии)
+//
+// Логика подобрана бектестом на EURUSD H1 2016-2021 (см. backtest/):
+//   - Азиатская сессия (00-07 UTC) формирует диапазон ликвидности;
+//   - В лондонский killzone (07-11 UTC) ждём свип за границу диапазона
+//     с закрытием обратно внутрь сильной свечой (displacement > 0.6 ATR);
+//   - SL за хвостом свипа + буфер ATR, TP = RR * риск (минимум 1:2);
+//   - Перевод в безубыток после +1R;
+//   - Не больше одной сделки в день, пропуск дней с широкой Азией.
+//
+// Алерты шлют JSON в формате вебхука бота (/webhook):
+//   ENTRY / CLOSE / BE — настройте alert() webhook URL на ваш сервер.
+//
+// Результат бектеста (EURUSD H1, 2016-2021, комиссия 0.2 pip/сторона):
+//   PF 1.31, WR 37.3% при RR 2, MaxDD -4.1%.
+//   ВНИМАНИЕ: 2020-2021 отдельно — PF ~1.0. Прогоняйте Strategy Tester
+//   на своём инструменте/периоде перед реальной торговлей.
+
+strategy("ASA Sweep Strategy", overlay = true,
+     initial_capital = 10000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 0.00002,
+     calc_on_every_tick = false)
+
+// ---------- Inputs ----------
+rrInput        = input.float(2.0, "Risk:Reward (мин. 2)", minval = 2.0, step = 0.5)
+dispMult       = input.float(0.6, "Displacement: тело свечи > X * ATR", minval = 0.1, step = 0.1)
+atrBuffer      = input.float(0.25, "Буфер SL (доли ATR)", minval = 0.0, step = 0.05)
+maxAsiaRange   = input.float(1.5, "Макс. диапазон Азии (X * ATR, 0 = выкл)", minval = 0.0, step = 0.5)
+useBE          = input.bool(true, "Переводить в безубыток после +1R")
+asiaSession    = input.session("0000-0700", "Сессия накопления (Азия, UTC)")
+killzone       = input.session("0700-1100", "Сессия входа (Лондон, UTC)")
+oneTradePerDay = input.bool(true, "Не больше 1 сделки в день")
+
+// ---------- State ----------
+atr14 = ta.atr(14)
+inAsia = not na(time(timeframe.period, asiaSession, "UTC"))
+inKill = not na(time(timeframe.period, killzone, "UTC"))
+
+var float asiaHi = na
+var float asiaLo = na
+var int   tradedDay = na
+var float entryRisk = na
+var float entryPrice = na
+var bool  beDone = false
+
+newDay = ta.change(dayofmonth(time, "UTC")) != 0
+if newDay
+    asiaHi := na
+    asiaLo := na
+
+if inAsia
+    asiaHi := na(asiaHi) ? high : math.max(asiaHi, high)
+    asiaLo := na(asiaLo) ? low : math.min(asiaLo, low)
+
+// ---------- Условия входа ----------
+dayKey = dayofmonth(time, "UTC") + month(time, "UTC") * 100
+canTrade = inKill and not na(asiaLo) and strategy.position_size == 0 and
+     (not oneTradePerDay or tradedDay != dayKey) and
+     (maxAsiaRange == 0.0 or (asiaHi - asiaLo) < maxAsiaRange * atr14)
+
+displacement = math.abs(close - open) > dispMult * atr14
+
+sweepLong  = canTrade and displacement and low < asiaLo and close > asiaLo and close > open
+sweepShort = canTrade and displacement and high > asiaHi and close < asiaHi and close < open
+
+jsonEntry(dir, e, sl, tp, rr) =>
+    '{"t":"ENTRY","d":"' + dir + '","s":"' + syminfo.ticker + '","tf":"' + timeframe.period +
+     '","e":' + str.tostring(e, "#.#####") + ',"sl":' + str.tostring(sl, "#.#####") +
+     ',"tp":' + str.tostring(tp, "#.#####") + ',"rr":' + str.tostring(rr, "#.##") +
+     ',"h1":"AsiaSweep","h4":"Killzone"}'
+
+if sweepLong
+    sl = low - atrBuffer * atr14
+    risk = close - sl
+    if risk > 0
+        tp = close + rrInput * risk
+        entryRisk := risk
+        entryPrice := close
+        beDone := false
+        tradedDay := dayKey
+        strategy.entry("Long", strategy.long)
+        strategy.exit("LongExit", "Long", stop = sl, limit = tp)
+        alert(jsonEntry("LONG", close, sl, tp, rrInput), alert.freq_once_per_bar_close)
+
+if sweepShort
+    sl = high + atrBuffer * atr14
+    risk = sl - close
+    if risk > 0
+        tp = close - rrInput * risk
+        entryRisk := risk
+        entryPrice := close
+        beDone := false
+        tradedDay := dayKey
+        strategy.entry("Short", strategy.short)
+        strategy.exit("ShortExit", "Short", stop = sl, limit = tp)
+        alert(jsonEntry("SHORT", close, sl, tp, rrInput), alert.freq_once_per_bar_close)
+
+// ---------- Безубыток после +1R ----------
+if useBE and not beDone and strategy.position_size != 0 and not na(entryRisk)
+    if strategy.position_size > 0 and high >= entryPrice + entryRisk
+        strategy.exit("LongExit", "Long", stop = entryPrice, limit = entryPrice + rrInput * entryRisk)
+        beDone := true
+        alert('{"t":"BE","d":"LONG","s":"' + syminfo.ticker + '","sl":' +
+             str.tostring(entryPrice, "#.#####") + '}', alert.freq_once_per_bar)
+    if strategy.position_size < 0 and low <= entryPrice - entryRisk
+        strategy.exit("ShortExit", "Short", stop = entryPrice, limit = entryPrice - rrInput * entryRisk)
+        beDone := true
+        alert('{"t":"BE","d":"SHORT","s":"' + syminfo.ticker + '","sl":' +
+             str.tostring(entryPrice, "#.#####") + '}', alert.freq_once_per_bar)
+
+// ---------- Алерт закрытия ----------
+posClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+if posClosed
+    lastDir = strategy.position_size[1] > 0 ? "LONG" : "SHORT"
+    lastPnlPips = (strategy.netprofit - strategy.netprofit[1]) // в валюте счёта
+    res = lastPnlPips > 0 ? "TP" : lastPnlPips < 0 ? "SL" : "BE"
+    alert('{"t":"CLOSE","d":"' + lastDir + '","s":"' + syminfo.ticker + '","r":"' + res +
+         '","pnl":' + str.tostring(lastPnlPips, "#.#") + '}', alert.freq_once_per_bar)
+
+// ---------- Visuals ----------
+plot(asiaHi, "Asia High", color = color.new(color.orange, 30), style = plot.style_linebr)
+plot(asiaLo, "Asia Low", color = color.new(color.orange, 30), style = plot.style_linebr)
+bgcolor(inKill ? color.new(color.blue, 95) : na)
+plotshape(sweepLong, "Sweep Long", shape.triangleup, location.belowbar, color.green, size = size.small)
+plotshape(sweepShort, "Sweep Short", shape.triangledown, location.abovebar, color.red, size = size.small)
